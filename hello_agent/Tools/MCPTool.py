@@ -1,10 +1,16 @@
-
+import asyncio
 import logging
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from .Tool import Tool
+from .ToolError import (
+    ToolBusinessError,
+    ToolTransportError,
+    ToolTimeoutError,
+    classify_exception,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +22,17 @@ class MCPTool(Tool):
     例如：它代表 `create_issue` 这个动作，而不是代表整个 Github MCP 服务。
     """
 
-    def __init__(self, name: str, original_name: str, description: str, input_schema: dict, session: ClientSession):
-        self.name = name
-        self._original_name = original_name  # 给底层 Server 看的原名：create_issue
-        self.description = description
+    def __init__(
+        self,
+        name: str,
+        original_name: str,
+        description: str,
+        input_schema: dict,
+        session: ClientSession,
+        retry_policy=None,
+    ):
+        super().__init__(name, description, retry_policy=retry_policy)
+        self._original_name = original_name
         self._input_schema = input_schema
         self._session = session  # 持有 Server 的连接句柄
 
@@ -39,24 +52,30 @@ class MCPTool(Tool):
         }
 
     async def execute(self, **kwargs) -> str:
-        """
-        Agent 直接调用这个执行逻辑。
-        大模型不需要传 tool_name，因为这个实例本身就是这个 tool。
-        """
         if not self._session:
-            return "error: MCP session is disconnected."
+            raise ToolTransportError("MCP session is disconnected")
 
+        timeout = self.retry_policy.timeout_seconds if self.retry_policy else 30.0
         try:
-            # 直接使用自身的 name 去调用底层的 session
-            result = await self._session.call_tool(self._original_name, arguments=kwargs)
-
-            content_parts = []
-            for item in result.content:
-                if hasattr(item, "text"):
-                    content_parts.append(item.text)
-            return "\n".join(content_parts)
+            result = await asyncio.wait_for(
+                self._session.call_tool(self._original_name, arguments=kwargs),
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            return f"Error executing {self.name}: {str(e)}"
+            raise classify_exception(e) from e
+
+        content_parts = [
+            item.text for item in result.content if hasattr(item, "text")
+        ]
+        text = "\n".join(content_parts)
+
+        # MCP 协议里的业务错误标记
+        if getattr(result, "isError", False):
+            raise ToolBusinessError(text or f"MCP tool {self.name} returned an error")
+
+        return text
 
 
 # 2. 这个类是“幕后管理者”,负责拉起进程，并“孵化”出上面的 MCPTool 列表
@@ -71,11 +90,13 @@ class MCPServerManager:
             command: str,
             args: List[str],
             env: Optional[Dict[str, str]] = None,
+            retry_policy=None
     ):
         self.server_name = name
         self._server_params = StdioServerParameters(command=command, args=args, env=env)
         self._session: Optional[ClientSession] = None
         self._exit_stack = AsyncExitStack()  # 安全管理异步上下文的利器
+        self._retry_policy = retry_policy
 
     async def start_and_get_tools(self) -> List[MCPTool]:
         """

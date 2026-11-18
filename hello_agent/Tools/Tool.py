@@ -1,23 +1,27 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
+from .ToolError import RetryPolicy
 
 
 class Tool(ABC):
-    """工具基类"""
-
-    def __init__(self, name: str, description: str):
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        retry_policy: Optional[RetryPolicy] = None,
+    ):
         self.name = name
         self.description = description
+        # None 表示使用 AgentConfig 里的全局默认值
+        self.retry_policy = retry_policy
 
     @abstractmethod
     async def execute(self, **kwargs) -> Any:
-        """tool统一运行入口"""
         pass
 
     @abstractmethod
     def get_parameters(self) -> Any:
-        """获取工具参数定义"""
         pass
 
     def to_openai_schema(self) -> Dict[str, Any]:

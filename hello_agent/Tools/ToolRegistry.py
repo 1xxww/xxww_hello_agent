@@ -2,6 +2,7 @@ import json
 import inspect
 from typing import List, Dict, Any
 from .Tool import Tool
+from .ToolError import ToolError, ToolNotFoundError
 
 
 class ToolRegistry:
@@ -31,25 +32,31 @@ class ToolRegistry:
                 print(f"[WARN] 生成工具 '{getattr(tool, 'name', '?')}' 的 schema 失败: {e}")
         return schemas
 
+    def get_tool(self, tool_name: str):
+        return self._tools.get(tool_name)
+
+    async def execute_tool_raw(self, tool_name: str, **kwargs) -> str:
+        """执行工具，失败时抛 ToolError。ToolCallRunner 用这个入口。"""
+        tool = self.get_tool(tool_name)
+        if tool is None:
+            raise ToolNotFoundError(
+                f"找不到名为 [{tool_name}] 的工具",
+                details={"available_tools": list(self._tools.keys())},
+            )
+
+        raw_result = tool.execute(**kwargs)
+        if inspect.isawaitable(raw_result):
+            result = await raw_result
+        else:
+            result = raw_result
+
+        if isinstance(result, str):
+            return result
+        return json.dumps(result, ensure_ascii=False, default=str)
+
     async def execute_tool(self, tool_name: str, **kwargs) -> str:
-        """统一执行工具入口"""
-        if tool_name not in self._tools:
-            return f"❌ 找不到名为 [{tool_name}] 的工具。"
-
-        tool = self._tools[tool_name]
+        """向后兼容接口：把异常转成字符串返回。"""
         try:
-            # 统一执行
-            raw_result = tool.execute(**kwargs)
-
-            # 魔法兼容：如果是异步工具就 await，如果是同步工具直接拿结果
-            if inspect.isawaitable(raw_result):
-                result = await raw_result
-            else:
-                result = raw_result
-
-            if isinstance(result, str):
-                return result
-            return json.dumps(result, ensure_ascii=False, default=str)
-
+            return await self.execute_tool_raw(tool_name, **kwargs)
         except Exception as e:
             return f"❌ 工具 [{tool_name}] 执行异常: {str(e)}"
